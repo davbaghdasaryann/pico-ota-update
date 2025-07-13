@@ -1,296 +1,362 @@
-#!/usr/bin/env python3
 """
-Test Script for OTA System
-Run this on your computer to test the server functionality
+Raspberry Pi Pico OTA Update System
+Main code that can update itself from a server
 """
+import machine
+import os
+import utime
+import ubinascii
+import gc
+try:
+    import ujson as json
+except ImportError:
+    import json
 
-import requests
-import json
-import time
+# Version and device info
+VERSION = "1.0.0"
+DEVICE_ID = "pico_001"
+OTA_SERVER = "http://your-server.com"  # Replace with your server URL
 
-# Configuration
-SERVER_URL = "http://localhost:3000"
-DEVICE_ID = "test_device_001"
+# Pin definitions
+led_pin = 25
+pwr_en = 14
+uart_port = 0
+uart_baute = 115200
 
-def test_health_check():
-    """Test server health"""
-    print("Testing server health...")
+# APN configuration
+APN = "cmnbiot"
+
+# Initialize LED
+led_onboard = machine.Pin(led_pin, machine.Pin.OUT)
+
+# Initialize UART
+uart = None
+
+def led_blink_pattern(pattern_name="default"):
+    """Different LED blink patterns"""
+    if pattern_name == "updating":
+        # Fast blink during update
+        for _ in range(10):
+            led_onboard.value(1)
+            utime.sleep(0.1)
+            led_onboard.value(0)
+            utime.sleep(0.1)
+    elif pattern_name == "error":
+        # SOS pattern
+        for _ in range(3):
+            led_onboard.value(1)
+            utime.sleep(0.1)
+            led_onboard.value(0)
+            utime.sleep(0.1)
+        utime.sleep(0.3)
+        for _ in range(3):
+            led_onboard.value(1)
+            utime.sleep(0.3)
+            led_onboard.value(0)
+            utime.sleep(0.3)
+        utime.sleep(0.3)
+        for _ in range(3):
+            led_onboard.value(1)
+            utime.sleep(0.1)
+            led_onboard.value(0)
+            utime.sleep(0.1)
+    else:
+        # Default pattern
+        led_onboard.value(1)
+        utime.sleep(0.5)
+        led_onboard.value(0)
+        utime.sleep(0.5)
+
+def powerOn(p):
+    machine.Pin(p, machine.Pin.OUT).value(1)
+    utime.sleep(2)
+
+def sendCMD_waitResp(cmd, timeout=3000):
+    print("CMD:", cmd)
     try:
-        response = requests.get(f"{SERVER_URL}/health")
-        if response.status_code == 200:
-            data = response.json()
-            print(f"✅ Server is healthy: {data['status']}")
-            print(f"   Devices: {data['devices_connected']}")
-            print(f"   Updates: {data['updates_available']}")
-            return True
-        else:
-            print(f"❌ Health check failed: {response.status_code}")
-            return False
+        uart.write(cmd.encode() + b'\r\n')
+        response = waitResp(timeout)
+        print("RESP:", response)
+        return response
     except Exception as e:
-        print(f"❌ Health check error: {e}")
+        print("UART CMD failed:", e)
+        return ""
+
+def waitResp(timeout=3000):
+    start = utime.ticks_ms()
+    resp = b""
+    while utime.ticks_diff(utime.ticks_ms(), start) < timeout:
+        if uart.any():
+            try:
+                resp += uart.read(1)
+            except:
+                break
+        utime.sleep_ms(10)
+    try:
+        return resp.decode('utf-8')
+    except:
+        return "(binary data)"
+
+def str_to_hexStr(string):
+    try:
+        return ubinascii.hexlify(string.encode('utf-8')).decode('utf-8')
+    except:
+        return string
+
+def hexStr_to_str(hex_str):
+    try:
+        return ubinascii.unhexlify(hex_str.encode('utf-8')).decode('utf-8')
+    except:
+        return hex_str
+
+def init_sim7020():
+    global uart
+    try:
+        uart = machine.UART(uart_port, uart_baute, bits=8, parity=None, stop=1)
+        powerOn(pwr_en)
+        utime.sleep(2)
+        
+        if uart.any():
+            uart.read()
+        
+        # Basic AT commands
+        sendCMD_waitResp("AT")
+        sendCMD_waitResp("ATE1")
+        
+        # Configure APN
+        sendCMD_waitResp("AT+CFUN=0")
+        utime.sleep(2)
+        sendCMD_waitResp("AT*MCGDEFCONT=\"IP\",\"{}\"".format(APN))
+        sendCMD_waitResp("AT+CFUN=1")
+        utime.sleep(10)
+        sendCMD_waitResp("AT+CGATT?")
+        
+        print("SIM7020E initialized successfully")
+        return True
+    except Exception as e:
+        print("SIM7020E initialization failed:", e)
         return False
 
-def test_check_update(current_version="1.0.0"):
-    """Test update checking"""
-    print(f"\nTesting update check for version {current_version}...")
+def http_get(url, endpoint):
+    """Make HTTP GET request"""
     try:
-        payload = {
+        print("Making HTTP GET request to:", url + endpoint)
+        sendCMD_waitResp("AT+CHTTPCREATE=\"{}\"".format(url))
+        utime.sleep(1)
+        sendCMD_waitResp("AT+CHTTPCON=0")
+        utime.sleep(2)
+        
+        response = sendCMD_waitResp("AT+CHTTPSEND=0,0,\"{}\"".format(endpoint))
+        utime.sleep(3)
+        
+        # Get response data
+        data_resp = sendCMD_waitResp("AT+CHTTPREAD=0")
+        
+        sendCMD_waitResp("AT+CHTTPDISCON=0")
+        sendCMD_waitResp("AT+CHTTPDESTROY=0")
+        
+        return data_resp
+    except Exception as e:
+        print("HTTP GET failed:", e)
+        return None
+
+def check_for_update():
+    """Check if there's a new version available"""
+    try:
+        print("Checking for updates...")
+        
+        # Create request payload
+        check_payload = {
             "device_id": DEVICE_ID,
-            "current_version": current_version,
+            "current_version": VERSION,
             "action": "check_update"
         }
         
-        response = requests.post(f"{SERVER_URL}/ota", json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("update_available"):
-                print(f"✅ Update available: {data['current_version']} -> {data['new_version']}")
-                print(f"   Description: {data['description']}")
-                return data['new_version']
-            else:
-                print(f"✅ No update available: {data['message']}")
-                return None
-        else:
-            print(f"❌ Update check failed: {response.status_code}")
-            return None
+        json_payload = json.dumps(check_payload)
+        hex_payload = str_to_hexStr(json_payload)
+        
+        # Make request
+        sendCMD_waitResp("AT+CHTTPCREATE=\"{}\"".format(OTA_SERVER))
+        utime.sleep(1)
+        sendCMD_waitResp("AT+CHTTPCON=0")
+        utime.sleep(2)
+        
+        post_cmd = "AT+CHTTPSEND=0,1,\"/ota\",,\"application/json\",{}".format(hex_payload)
+        sendCMD_waitResp(post_cmd)
+        utime.sleep(3)
+        
+        # Get response
+        response = sendCMD_waitResp("AT+CHTTPREAD=0")
+        
+        sendCMD_waitResp("AT+CHTTPDISCON=0")
+        sendCMD_waitResp("AT+CHTTPDESTROY=0")
+        
+        # Parse response
+        if response and "update_available" in response:
+            try:
+                # Extract JSON from response
+                json_start = response.find('{')
+                json_end = response.rfind('}') + 1
+                if json_start != -1 and json_end != -1:
+                    json_str = response[json_start:json_end]
+                    update_info = json.loads(json_str)
+                    return update_info
+            except:
+                pass
+        
+        return None
     except Exception as e:
-        print(f"❌ Update check error: {e}")
+        print("Update check failed:", e)
         return None
 
-def test_download_update():
-    """Test update download"""
-    print("\nTesting update download...")
+def download_update():
+    """Download new code from server"""
     try:
-        payload = {
+        print("Downloading update...")
+        led_blink_pattern("updating")
+        
+        # Request download
+        download_payload = {
             "device_id": DEVICE_ID,
             "action": "download_update"
         }
         
-        response = requests.post(f"{SERVER_URL}/ota", json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("success"):
-                print(f"✅ Update downloaded: {data['version']}")
-                print(f"   Description: {data['description']}")
-                print(f"   Code size: {len(data['new_code']) // 2} bytes")
-                return data
+        json_payload = json.dumps(download_payload)
+        hex_payload = str_to_hexStr(json_payload)
+        
+        sendCMD_waitResp("AT+CHTTPCREATE=\"{}\"".format(OTA_SERVER))
+        utime.sleep(1)
+        sendCMD_waitResp("AT+CHTTPCON=0")
+        utime.sleep(2)
+        
+        post_cmd = "AT+CHTTPSEND=0,1,\"/ota\",,\"application/json\",{}".format(hex_payload)
+        sendCMD_waitResp(post_cmd)
+        utime.sleep(5)  # Longer timeout for download
+        
+        # Get response with code
+        response = sendCMD_waitResp("AT+CHTTPREAD=0", timeout=10000)
+        
+        sendCMD_waitResp("AT+CHTTPDISCON=0")
+        sendCMD_waitResp("AT+CHTTPDESTROY=0")
+        
+        if response and "new_code" in response:
+            try:
+                # Extract JSON from response
+                json_start = response.find('{')
+                json_end = response.rfind('}') + 1
+                if json_start != -1 and json_end != -1:
+                    json_str = response[json_start:json_end]
+                    update_data = json.loads(json_str)
+                    
+                    if "new_code" in update_data:
+                        # Decode the new code
+                        new_code = hexStr_to_str(update_data["new_code"])
+                        return new_code
+            except Exception as e:
+                print("Failed to parse update data:", e)
+        
+        return None
+    except Exception as e:
+        print("Download failed:", e)
+        return None
+
+def apply_update(new_code):
+    """Apply the downloaded update"""
+    try:
+        print("Applying update...")
+        led_blink_pattern("updating")
+        
+        # Backup current main.py
+        try:
+            with open("main.py", "r") as f:
+                current_code = f.read()
+            with open("main_backup.py", "w") as f:
+                f.write(current_code)
+            print("Backup created")
+        except:
+            print("Backup creation failed")
+        
+        # Write new code
+        with open("main.py", "w") as f:
+            f.write(new_code)
+        
+        print("Update applied successfully")
+        print("Restarting in 3 seconds...")
+        utime.sleep(3)
+        machine.reset()
+        
+    except Exception as e:
+        print("Update application failed:", e)
+        led_blink_pattern("error")
+        return False
+
+def perform_ota_update():
+    """Main OTA update function"""
+    try:
+        print("=== Starting OTA Update Check ===")
+        
+        # Check for updates
+        update_info = check_for_update()
+        
+        if update_info and update_info.get("update_available"):
+            print("Update available! Version:", update_info.get("new_version"))
+            
+            # Download update
+            new_code = download_update()
+            
+            if new_code:
+                print("Code downloaded successfully")
+                
+                # Apply update
+                apply_update(new_code)
             else:
-                print(f"❌ Download failed: {data.get('error')}")
-                return None
+                print("Failed to download update")
+                return False
         else:
-            print(f"❌ Download failed: {response.status_code}")
-            return None
+            print("No updates available")
+            return True
+            
     except Exception as e:
-        print(f"❌ Download error: {e}")
-        return None
-
-def test_get_devices():
-    """Test getting device list"""
-    print("\nTesting device list...")
-    try:
-        response = requests.get(f"{SERVER_URL}/devices")
-        if response.status_code == 200:
-            data = response.json()
-            print(f"✅ Found {data['total_devices']} devices:")
-            for device in data['devices']:
-                print(f"   - {device['device_id']} (v{device['current_version']})")
-            return data['devices']
-        else:
-            print(f"❌ Device list failed: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Device list error: {e}")
-        return None
-
-def test_get_updates():
-    """Test getting update list"""
-    print("\nTesting update list...")
-    try:
-        response = requests.get(f"{SERVER_URL}/updates")
-        if response.status_code == 200:
-            data = response.json()
-            print(f"✅ Found {data['total_updates']} updates:")
-            for update in data['updates']:
-                print(f"   - v{update['version']}: {update['description']} ({update['code_size']} bytes)")
-            return data['updates']
-        else:
-            print(f"❌ Update list failed: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"❌ Update list error: {e}")
-        return None
-
-def test_add_custom_update():
-    """Test adding a custom update"""
-    print("\nTesting custom update addition...")
-    
-    custom_code = '''"""
-Custom Test Code - LED Sequence
-Version 4.0.0
-"""
-import machine
-import utime
-
-VERSION = "4.0.0"
-led = machine.Pin(25, machine.Pin.OUT)
+        print("OTA update failed:", e)
+        led_blink_pattern("error")
+        return False
 
 def main():
-    print("Custom test code running!")
-    counter = 0
+    """Main application loop"""
+    print("=== Raspberry Pi Pico OTA System ===")
+    print("Version:", VERSION)
+    print("Device ID:", DEVICE_ID)
+    
+    # Initialize SIM7020E
+    if not init_sim7020():
+        print("Failed to initialize SIM7020E")
+        while True:
+            led_blink_pattern("error")
+            utime.sleep(2)
+    
+    # Main loop
+    update_counter = 0
     while True:
-        # Sequence: 1-2-3 blinks
-        for i in range(1, 4):
-            for _ in range(i):
-                led.value(1)
-                utime.sleep(0.2)
-                led.value(0)
-                utime.sleep(0.2)
-            utime.sleep(1)
-        counter += 1
-        if counter % 5 == 0:
-            print(f"Sequence count: {counter}")
+        try:
+            print("\n--- Main Loop ---")
+            
+            # Normal operation - blink LED
+            led_blink_pattern("default")
+            
+            # Check for OTA updates every 10 loops (adjust as needed)
+            update_counter += 1
+            if update_counter >= 10:
+                update_counter = 0
+                perform_ota_update()
+            
+            # Wait before next iteration
+            utime.sleep(5)
+            
+        except Exception as e:
+            print("Main loop error:", e)
+            led_blink_pattern("error")
+            utime.sleep(5)
 
+# Run main application
 if __name__ == "__main__":
     main()
-'''
-    
-    try:
-        payload = {
-            "version": "4.0.0",
-            "description": "Custom LED sequence test",
-            "code": custom_code
-        }
-        
-        response = requests.post(f"{SERVER_URL}/updates", json=payload)
-        if response.status_code == 200:
-            data = response.json()
-            print(f"✅ Custom update added: {data['message']}")
-            return True
-        else:
-            print(f"❌ Custom update failed: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"❌ Custom update error: {e}")
-        return False
-
-def simulate_device_lifecycle():
-    """Simulate a complete device update lifecycle"""
-    print("\n" + "="*50)
-    print("SIMULATING DEVICE UPDATE LIFECYCLE")
-    print("="*50)
-    
-    current_version = "1.0.0"
-    
-    # Step 1: Check for updates
-    new_version = test_check_update(current_version)
-    if not new_version:
-        print("No updates available, lifecycle complete")
-        return
-    
-    # Step 2: Download update
-    update_data = test_download_update()
-    if not update_data:
-        print("Download failed, lifecycle aborted")
-        return
-    
-    # Step 3: Simulate applying update
-    print(f"\n📦 Simulating update application...")
-    print(f"   Current: {current_version}")
-    print(f"   New: {new_version}")
-    print(f"   ✅ Update would be applied successfully!")
-    
-    # Step 4: Check next update
-    print(f"\n🔄 Checking for next update after {new_version}...")
-    next_version = test_check_update(new_version)
-    if next_version:
-        print(f"   Next available: {next_version}")
-    else:
-        print("   Device would be up to date")
-
-def run_all_tests():
-    """Run all tests"""
-    print("🚀 Starting OTA System Tests")
-    print("="*50)
-    
-    # Basic connectivity
-    if not test_health_check():
-        print("❌ Server not accessible, stopping tests")
-        return False
-    
-    # Test endpoints
-    test_get_updates()
-    test_get_devices()
-    
-    # Test OTA flow
-    test_check_update("1.0.0")
-    test_check_update("2.0.0")
-    test_check_update("3.0.0")  # Should be up to date
-    
-    # Test download
-    test_download_update()
-    
-    # Add custom update
-    test_add_custom_update()
-    
-    # Test updated list
-    test_get_updates()
-    
-    # Full lifecycle simulation
-    simulate_device_lifecycle()
-    
-    print("\n✅ All tests completed!")
-    return True
-
-def interactive_test():
-    """Interactive test mode"""
-    while True:
-        print("\n" + "="*40)
-        print("OTA System Interactive Test")
-        print("="*40)
-        print("1. Health Check")
-        print("2. Check for Updates")
-        print("3. Download Update")
-        print("4. List Devices")
-        print("5. List Updates")
-        print("6. Add Custom Update")
-        print("7. Full Lifecycle Test")
-        print("8. Run All Tests")
-        print("9. Exit")
-        
-        choice = input("\nSelect option (1-9): ").strip()
-        
-        if choice == "1":
-            test_health_check()
-        elif choice == "2":
-            version = input("Enter current version (default: 1.0.0): ").strip()
-            if not version:
-                version = "1.0.0"
-            test_check_update(version)
-        elif choice == "3":
-            test_download_update()
-        elif choice == "4":
-            test_get_devices()
-        elif choice == "5":
-            test_get_updates()
-        elif choice == "6":
-            test_add_custom_update()
-        elif choice == "7":
-            simulate_device_lifecycle()
-        elif choice == "8":
-            run_all_tests()
-        elif choice == "9":
-            print("Goodbye!")
-            break
-        else:
-            print("Invalid option, please try again")
-
-if __name__ == "__main__":
-    import sys
-    
-    print("OTA System Test Script")
-    print("Make sure your server is running on", SERVER_URL)
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
-        interactive_test()
-    else:
-        run_all_tests()
